@@ -7,6 +7,18 @@
 #
 # [1]: https://leanprover-community.github.io/glossary.html#unicode-abbreviation
 
+# TODO(enricozb): attempt to add some functionality where the abbreviation is
+# completed after the first non-matching character is inserted. This can
+# implicitly include <space> and <ret>, but it would allow for writing something
+# like
+#
+#   \<<a, b\>>,
+#
+# and have it complete to ⟪a, b⟫, without needing to use backspace.
+#
+# TODO(enricozb): when deleting the initiating backslash in insert mode, the
+# abbreviation is still "active" but no backslash exists. We should detect this
+# and exit the abbreviation mode.
 
 # ---------------------------------- options -----------------------------------
 declare-option -docstring '
@@ -41,7 +53,6 @@ declare-option -docstring '
   echo $(dirname "$kak_source")/symbols.kak-completions
 }
 
-
 # ---------------------------------- commands ----------------------------------
 
 define-command math-enable-abbreviations -docstring '
@@ -68,9 +79,17 @@ define-command math-enable-abbreviations -docstring '
     fi
   }
 
-  remove-hooks window math-enter-completion-mode
+  set-option window completers option=math_completions
 
-  hook -group math-enter-completion-mode window InsertKey '\\' math-enter-completion-mode
+  # remove existing highlighter in case abbreviations were previously enabled
+  try %{ remove-highlighter window/math-abbreviations }
+  add-highlighter window/math-active-abbreviations ranges math_active_abbreviation_ranges
+
+  # remove existing hooks in case abbreviations were previously enabled
+  remove-hooks window math-enter-completion-mode
+  hook -group math-enter-completion-mode window InsertKey '\\' %{
+    math-enter-completion-mode
+  }
 }
 
 define-command math-disable-abbreviations -docstring '
@@ -79,20 +98,29 @@ define-command math-disable-abbreviations -docstring '
   This command does not unload the completion entries read from the
   `math_completions_file` option.
 ' %{
+  set-option -remove window completers option=math_completions
   remove-hooks window math-enter-completion-mode
 }
 
-
 # ------------------------------- implementation -------------------------------
+
+# the location of each \ in an active abbreviation as a list of <line>.<column>
+declare-option -hidden str-list math_active_abbreviations
 
 # for showing the completions under the cursor
 declare-option -hidden str-list math_completion_entries
 declare-option -hidden completions math_completions
 
-define-command -hidden math-complete-abbreviation -docstring '
+# the location of each \ in an active abbreviation as a list of
+# <line>.<column>,<line>.<column+1>. this is used in a highlighter along with
+# the timestamp of the insertion of the \ character, to bold every active
+# abbreviation.
+declare-option -hidden range-specs math_active_abbreviation_ranges
+
+define-command -override -hidden math-complete-abbreviation -docstring '
   Completes the abbreviation under the cursor.
 '%{
-  evaluate-commands -draft -save-regs '^/' %{
+  evaluate-commands -save-regs '"^/' %{
     # save the selection for the abbreviation including the leading backslash.
     #
     # this selects everything after the last backslash, which should be the
@@ -105,36 +133,78 @@ define-command -hidden math-complete-abbreviation -docstring '
     # save the abbreviation text, excluding the leading backslash
     execute-keys -save-regs '' 1s\\([^\\]+)<ret>
 
-    # compute the abbreviation using symbols_file
-    # TODO(enricozb): change this to echo the zc$found<esc> or to fail with
-    # a message
+    # compute the abbreviation using symbols_file, failing with a message if
+    # no matching abbreviation is found.
     evaluate-commands %sh{
-      found=$(awk -v q="$kak_selection" 'index($1, q) == 1 { print $2; exit }' "$kak_opt_math_symbols_file")
+      found=$(
+        awk -v \
+          q="$kak_selection" \
+          'index($1, q) == 1 { print $2; exit }' \
+          "$kak_opt_math_symbols_file"
+      )
 
       if [ -z "$found" ]; then
         # show an error message
-        printf 'fail %s' "no abbreviation found for: $kak_selection"
+        printf 'fail %s\n' "no abbreviation found for: $kak_selection"
       fi
 
-      # restore the original selection, including the lead backslash, and replace
-      # it with the abbreviation
-      printf 'execute-keys zc%s<esc>' "$found"
+      # restore the original selection, including the lead backslash, and
+      # replace it with the abbreviation
+      printf 'set-register dquote %%@%s@\n' "$found"
+      printf 'execute-keys zR%s\n' "$found"
     }
   }
 }
 
-define-command -hidden math-enter-completion-mode %{
-  set-option window math_completions "%val{cursor_line}.%val{cursor_column}@%val{timestamp}" %opt{math_completion_entries}
+define-command -hidden math-complete-active-abbreviations -docstring '
+  Restore the selections of the active completions and attempt to complete
+  each of them.
+' %{
+  evaluate-commands -draft -save-regs '^' %{
+    set-register '^' %opt{math_active_abbreviations}
+    execute-keys z
+    evaluate-commands -itersel %{ try math-complete-abbreviation }
+  }
+}
+
+define-command -hidden math-enter-completion-mode -docstring '
+  Enters the abbreviation completion "mode".
+
+  This is called after an InsertKey "\\" hook fires. The location the inserted
+  backslash is saved (of every backslash in the case of multiple cursors).
+  Once a <space> or <ret> is entered, the abbreviations at each of the saved
+  backslashes are attempted to be completed.
+
+  If the mode changes (for example, to normal mode) the completion mode is
+  exited, and no abbreviation matching is attempted.
+'%{
+  # save the selections for all leading backslashes
+  evaluate-commands -draft -save-regs '^' %{
+    execute-keys -save-regs '' hZ
+    set-option window math_active_abbreviations %reg{^}
+  }
+
+  # add active abbreviation highlighters
+  set-option window math_active_abbreviation_ranges %val{timestamp}
+  evaluate-commands -draft -itersel %{
+    # save cursor positions of the backslash and the column immediately after
+    set-register e "%val{cursor_line}.%val{cursor_column}"
+    execute-keys h
+    set-register s "%val{cursor_line}.%val{cursor_column}"
+
+    set-option -add window math_active_abbreviation_ranges \
+      "%reg{s},%reg{e}|+b"
+  }
+
+  # set up the option to show completions under the cursor
+  # TODO(enricozb): this does nothing under multiple cursors
+  set-option window math_completions \
+      "%val{cursor_line}.%val{cursor_column}@%val{timestamp}" \
+    %opt{math_completion_entries}
   set-option window completers option=math_completions %opt{completers}
 
   hook -group math-exit-completion-mode -once window InsertKey '(<space>|<ret>)' %{
-    try %{
-      evaluate-commands -draft %{
-        execute-keys hh
-        math-complete-abbreviation
-      }
-    }
-
+    math-complete-active-abbreviations
     math-exit-completion-mode
   }
 
@@ -143,8 +213,12 @@ define-command -hidden math-enter-completion-mode %{
   }
 }
 
-define-command -hidden math-exit-completion-mode %{
-  set-option -remove window completers option=math_completions
+define-command -hidden math-exit-completion-mode -docstring '
+  Cleans up options, hooks and highlighters.
+' %{
+  unset-option window math_completions
+  unset-option window math_active_abbreviations
+  unset-option window math_active_abbreviation_ranges
 
   remove-hooks window math-exit-completion-mode
 }
